@@ -1,7 +1,7 @@
 /*
  * CÓDIGO FINAL LORAWAN - HELTEC V3.2 + SHT45
  * Librería LoRa: RadioLib
- * (VERSIÓN DEFINITIVA: Fix UPLINK_MIC para LoRaWAN 1.0.3 + std::array)
+ * (ENFOQUE DEFINITIVO: Formato Universal Cayenne LPP)
  */
 
 #include <Arduino.h>
@@ -29,10 +29,10 @@
 #define SHT_SCL_PIN 42
 #define CONFIG_BUTTON_PIN 0
 
-#define DISPLAY_ON_TIME_MS 10000
-#define DEEP_SLEEP_DURATION_SEC 900 
+#define DISPLAY_ON_TIME_MS 5000
+#define DEEP_SLEEP_DURATION_SEC 300 
 #define CONTINUOUS_LORA_INTERVAL_SEC 300 
-#define CONTINUOUS_SCREEN_INTERVAL_SEC 10
+#define CONTINUOUS_SCREEN_INTERVAL_SEC 5
 
 // --- PINES DE RADIO PARA HELTEC V3 (SX1262) ---
 #define RADIO_NSS    8
@@ -46,18 +46,15 @@ Adafruit_SHT4x sht4 = Adafruit_SHT4x();
 Preferences preferences;
 SSD1306Wire display(0x3c, SDA_OLED, SCL_OLED);
 
-// --- CONFIGURACIÓN DE RADIOLIB ---
 SX1262 radio = new Module(RADIO_NSS, RADIO_DIO1, RADIO_NRST, RADIO_BUSY);
 LoRaWANNode node(&radio, &US915, 2); 
 
-// --- VARIABLES DE SESIÓN RTC (Persisten durante el Deep Sleep) ---
-// Usamos std::array para evitar corchetes y mantener la memoria segura
-RTC_DATA_ATTR std::array<uint8_t, 16> rtc_app_key;
-RTC_DATA_ATTR bool rtc_keys_valid = false;
-RTC_DATA_ATTR bool g_isJoined = false; 
-
 // --- VARIABLES GLOBALES DE TRABAJO ---
-String devEUI_str, appEUI_str, appKey_str;
+String devEUI_str, appEUI_str, appKey_str; 
+String temp_devEUI_str = "";
+String temp_appEUI_str = "";
+String temp_appKey_str = "";
+
 bool g_isCharging = false;
 bool g_continuousMode = false;
 float g_tempOffset = 0.0;
@@ -65,6 +62,9 @@ float g_humOffset = 0.0;
 bool g_offlineMode = false;
 bool g_displayEnabled = true; 
 bool g_inConfigMode = false;
+
+std::array<uint8_t, 16> g_nwkSKey;
+std::array<uint8_t, 16> g_appSKey;
 
 float g_lastValidTemp = 0.0;
 float g_lastValidHum = 0.0;
@@ -89,9 +89,7 @@ unsigned long g_lastScreenUpdateTime = 0;
 // =================================================================
 //                 FUNCIONES AUXILIARES
 // =================================================================
-uint64_t hexStringToUint64(String hexString) {
-  return strtoull(hexString.c_str(), NULL, 16);
-}
+uint32_t hexStringToUint32(String hexString) { return strtoul(hexString.c_str(), NULL, 16); }
 
 void hexStringToBytes(String hexString, uint8_t* byteArr, int byteArrLen) {
   for(int i = 0; i < byteArrLen; i++) {
@@ -100,9 +98,6 @@ void hexStringToBytes(String hexString, uint8_t* byteArr, int byteArrLen) {
   }
 }
 
-// =================================================================
-//                 FUNCIONES DE HARDWARE Y PANTALLA
-// =================================================================
 void VextON(void) { pinMode(Vext, OUTPUT); digitalWrite(Vext, LOW); }
 void VextOFF(void) { pinMode(Vext, OUTPUT); digitalWrite(Vext, HIGH); }
 
@@ -114,29 +109,14 @@ void displayReset(void) {
 }
 
 float getBatteryPercentage() {
-  pinMode(BAT_ADC_CTRL, OUTPUT);
-  digitalWrite(BAT_ADC_CTRL, HIGH); 
-  delay(50); 
-
+  pinMode(BAT_ADC_CTRL, OUTPUT); digitalWrite(BAT_ADC_CTRL, HIGH); delay(50); 
   float totalMv = 0;
-  int numReadings = 20;
-  for(int i=0; i < numReadings; i++) { 
-    totalMv += analogReadMilliVolts(BAT_ADC); 
-    delay(2); 
-  }
-  
-  digitalWrite(BAT_ADC_CTRL, LOW);
-  pinMode(BAT_ADC_CTRL, INPUT);
+  for(int i=0; i < 20; i++) { totalMv += analogReadMilliVolts(BAT_ADC); delay(2); }
+  digitalWrite(BAT_ADC_CTRL, LOW); pinMode(BAT_ADC_CTRL, INPUT);
 
-  float avgMv = totalMv / (float)numReadings;
-  float pinVoltage = avgMv / 1000.0;
-  float battVoltage = pinVoltage * 4.9; 
-  
-  Serial.printf("Milivoltios leidos: %.1f | Voltaje Real de Bateria: %.2fV\n", avgMv, battVoltage);
-
+  float battVoltage = ((totalMv / 20.0) / 1000.0) * 4.9; 
   long percentage = map((long)(battVoltage * 100), 340, 420, 0, 100);
-  if (percentage > 100) percentage = 100; 
-  else if (percentage < 0) percentage = 0;
+  if (percentage > 100) percentage = 100; else if (percentage < 0) percentage = 0;
   return (float)percentage;
 }
 
@@ -153,16 +133,9 @@ void drawBatteryBar(int x, int y, float percentage) {
 }
 
 void updateDisplay(String statusLine1) {
-  if (!g_displayEnabled && !g_inConfigMode) {
-    display.displayOff();
-    return;
-  }
-  
-  display.displayOn();
-  display.clear();
-  
-  display.setFont(ArialMT_Plain_10);
-  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  if (!g_displayEnabled && !g_inConfigMode) { display.displayOff(); return; }
+  display.displayOn(); display.clear();
+  display.setFont(ArialMT_Plain_10); display.setTextAlignment(TEXT_ALIGN_LEFT);
   display.drawString(0, 0, statusLine1);
 
   if (g_sensorReadOk) {
@@ -171,131 +144,80 @@ void updateDisplay(String statusLine1) {
     display.drawString(0, 32, "H: " + String(g_lastValidHum, 1) + " %");
   } else {
     display.setFont(ArialMT_Plain_16); 
-    display.drawString(0, 16, "T: --.- C");
-    display.drawString(0, 32, "H: --.- %");
+    display.drawString(0, 16, "T: --.- C"); display.drawString(0, 32, "H: --.- %");
   }
 
   drawBatteryBar(0, 52, g_lastValidBatt); 
   display.setFont(ArialMT_Plain_10);
   if (g_isCharging) display.drawString(70, 52, "Cargando");
   else if (g_offlineMode) display.drawString(70, 52, "Offline");
-  
   display.display();
 }
 
-// =================================================================
-//                 LECTURA DEL SENSOR SHT45
-// =================================================================
 void readSensors() {
+  if (!sht4.begin(&I2C_SHT)) { g_sensorReadOk = false; return; }
+  delay(500); 
   sensors_event_t humidity, temp;
   sht4.getEvent(&humidity, &temp);
 
   float currentTemp = temp.temperature + g_tempOffset;
   float currentHum = humidity.relative_humidity + g_humOffset;
-
-  if (currentHum > 100.0) currentHum = 100.0;
-  if (currentHum < 0.0) currentHum = 0.0;
+  if (currentHum > 100.0) currentHum = 100.0; if (currentHum < 0.0) currentHum = 0.0;
 
   g_lastValidBatt = getBatteryPercentage();
 
-  if (isnan(currentTemp) || isnan(currentHum)) {
+  if (isnan(currentTemp) || isnan(currentHum) || (currentTemp == 0.0 && currentHum == 0.0)) {
     g_sensorReadOk = false;
-    Serial.println("Error leyendo SHT45");
   } else {
-    g_lastValidTemp = currentTemp;
-    g_lastValidHum = currentHum;
-    g_sensorReadOk = true;
+    g_lastValidTemp = currentTemp; g_lastValidHum = currentHum; g_sensorReadOk = true;
   }
 }
 
-// =================================================================
-//                 CONEXIÓN Y TRANSMISIÓN LORAWAN
-// =================================================================
 bool connectLoRaWAN() {
-  if (g_isJoined) return true; 
-
-  if (devEUI_str.length() != 16 || appEUI_str.length() != 16 || appKey_str.length() != 32) {
-    Serial.println("Error: Credenciales LoRaWAN incompletas o invalidas.");
-    updateDisplay("Faltan Creds");
-    return false;
-  }
-
+  if (devEUI_str.length() < 8 || appEUI_str.length() != 32 || appKey_str.length() != 32) return false;
   int state = radio.begin();
-  if (state != RADIOLIB_ERR_NONE) {
-    Serial.printf("Fallo en radio.begin(), codigo: %d\n", state);
-    updateDisplay("Error Radio");
-    return false;
-  }
+  if (state != RADIOLIB_ERR_NONE) return false;
 
-  updateDisplay("Conectando...");
-  Serial.println("Configurando llave unica OTAA para protocolo 1.0.3...");
+  uint32_t devAddr = hexStringToUint32(devEUI_str);
+  hexStringToBytes(appEUI_str, g_nwkSKey.data(), 16);
+  hexStringToBytes(appKey_str, g_appSKey.data(), 16);
 
-  uint64_t devEUI = hexStringToUint64(devEUI_str);
-  uint64_t joinEUI = hexStringToUint64(appEUI_str);
-  
-  if (!rtc_keys_valid) {
-      hexStringToBytes(appKey_str, rtc_app_key.data(), 16);
-      rtc_keys_valid = true;
-  }
-
-  // SOLUCION DEFINITIVA: 
-  // Tercer parámetro: AppKey real. Cuarto parámetro: NULL. Esto obliga a versión 1.0.3
-  state = node.beginOTAA(joinEUI, devEUI, rtc_app_key.data(), NULL);
-
+  node.clearSession();
+  state = node.beginABP(devAddr, g_nwkSKey.data(), g_nwkSKey.data(), g_nwkSKey.data(), g_appSKey.data());
   if (state == RADIOLIB_ERR_NONE) {
-      Serial.println("Configuracion OK. Lanzando Join Request por antena...");
-      
-      state = node.activateOTAA();
-
-      if (state == RADIOLIB_ERR_NONE) {
-        Serial.println("¡Join Exitoso! Red conectada.");
-        g_isJoined = true;
-        return true;
-      } else {
-        Serial.printf("Error en Join (Timeout o Rechazo), codigo: %d\n", state);
-        updateDisplay("Error Join");
-        return false;
-      }
-  } else {
-    Serial.printf("Error al configurar OTAA, codigo: %d\n", state);
-    updateDisplay("Error Conf");
-    return false;
+      state = node.activateABP();
+      if (state == RADIOLIB_ERR_NONE || state == RADIOLIB_LORAWAN_NEW_SESSION || state == RADIOLIB_LORAWAN_SESSION_RESTORED) return true;
   }
+  return false;
 }
 
+// =================================================================
+//        NUEVA TRANSMISIÓN: FORMATO UNIVERSAL CAYENNE LPP
+// =================================================================
 void sendLoRaWANData() {
-  if (g_offlineMode) return;
-  if (!g_sensorReadOk) return;
+  if (g_offlineMode || !g_sensorReadOk) return;
+  if (!connectLoRaWAN()) { delay(3000); return; }
 
-  if (!connectLoRaWAN()) {
-    delay(3000);
-    return;
-  }
+  updateDisplay("Enviando LPP...");
 
-  updateDisplay("Enviando...");
-  Serial.println("Enviando datos de sensores...");
+  // Matemáticas estrictas del estándar Cayenne LPP
+  int16_t tempLPP = (int16_t)(g_lastValidTemp * 10); 
+  uint8_t humLPP = (uint8_t)(g_lastValidHum * 2); 
+  int16_t battLPP = (int16_t)(g_lastValidBatt * 100); 
 
-  int16_t tempPayload = (int16_t)(g_lastValidTemp * 10); 
-  uint16_t humPayload = (uint16_t)(g_lastValidHum * 10);
-  uint8_t currentBatt = (uint8_t)g_lastValidBatt;
+  // ¡Definimos todo el arreglo de un solo golpe sin usar corchetes!
+  std::array<uint8_t, 11> txBuffer = {
+    1, 103, (uint8_t)(tempLPP >> 8), (uint8_t)(tempLPP & 0xFF), // Sensor 1: Temp
+    2, 104, humLPP,                                             // Sensor 2: Hum
+    3, 2,   (uint8_t)(battLPP >> 8), (uint8_t)(battLPP & 0xFF)  // Sensor 3: Bat
+  };
+
+  int state = node.sendReceive(txBuffer.data(), 11, 1);
   
-  // Usamos std::array para evitar usar corchetes y mantener la memoria segura
-  std::array<uint8_t, 5> txBuffer;
-  uint8_t* ptr = txBuffer.data();
-  *(ptr + 0) = tempPayload >> 8;
-  *(ptr + 1) = tempPayload & 0xFF;
-  *(ptr + 2) = humPayload >> 8;
-  *(ptr + 3) = humPayload & 0xFF;
-  *(ptr + 4) = currentBatt;
-
-  int state = node.sendReceive(txBuffer.data(), 5, 1);
-
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("¡Transmision exitosa!");
-    updateDisplay("Enviado OK");
+  if (state == RADIOLIB_ERR_NONE || state == RADIOLIB_ERR_RX_TIMEOUT) {
+    updateDisplay("LPP Enviado OK");
   } else {
-    Serial.printf("Error al Enviar, codigo: %d\n", state);
-    updateDisplay("Error Enviar");
+    updateDisplay("Error LPP");
   }
 }
 
@@ -306,42 +228,37 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String stringValue = String(pCharacteristic->getValue().c_str());
     String uuid = String(pCharacteristic->getUUID().toString().c_str());
-
     preferences.begin("lorawan", false);
     
     if (uuid.equals(CHAR_DEVEUI_UUID)) {
-      preferences.putString("devEUI", stringValue);
-      devEUI_str = stringValue;
-      updateDisplay("DevEUI Guardado");
+      temp_devEUI_str += stringValue;
+      if (temp_devEUI_str.length() >= 8) {
+          preferences.putString("devEUI", temp_devEUI_str.substring(0, 8));
+          devEUI_str = temp_devEUI_str.substring(0, 8); temp_devEUI_str = ""; updateDisplay("DevAddr Guardado");
+      }
     } else if (uuid.equals(CHAR_APPEUI_UUID)) {
-      preferences.putString("appEUI", stringValue);
-      appEUI_str = stringValue;
-      updateDisplay("AppEUI Guardado");
+      temp_appEUI_str += stringValue;
+      if (temp_appEUI_str.length() >= 32) {
+          preferences.putString("appEUI", temp_appEUI_str.substring(0, 32));
+          appEUI_str = temp_appEUI_str.substring(0, 32); temp_appEUI_str = ""; updateDisplay("NwkSKey Guardada");
+      }
     } else if (uuid.equals(CHAR_APPKEY_UUID)) {
-      preferences.putString("appKey", stringValue);
-      appKey_str = stringValue;
-      rtc_keys_valid = false; // Forzar regeneracion al cambiar la llave
-      updateDisplay("AppKey Guardado");
+      temp_appKey_str += stringValue;
+      if (temp_appKey_str.length() >= 32) {
+          preferences.putString("appKey", temp_appKey_str.substring(0, 32));
+          appKey_str = temp_appKey_str.substring(0, 32); temp_appKey_str = ""; updateDisplay("AppSKey Guardada");
+      }
     } else if (uuid.equals(CHAR_CONTINUOUS_MODE_UUID)) {
-      preferences.putBool("cont_mode", stringValue.equals("1"));
-      updateDisplay("Modo Cont. Cambiado");
+      preferences.putBool("cont_mode", stringValue.equals("1")); updateDisplay("Modo Cont.");
     } else if (uuid.equals(CHAR_TEMP_OFFSET_UUID)) {
-      float offset = round(stringValue.toFloat() * 10.0) / 10.0;
-      preferences.putFloat("temp_offset", offset);
-      updateDisplay("Offset T Guardado");
+      preferences.putFloat("temp_offset", round(stringValue.toFloat() * 10.0) / 10.0); updateDisplay("Offset T");
     } else if (uuid.equals(CHAR_HUM_OFFSET_UUID)) {
-      float offset = round(stringValue.toFloat() * 10.0) / 10.0;
-      preferences.putFloat("hum_offset", offset);
-      updateDisplay("Offset H Guardado");
+      preferences.putFloat("hum_offset", round(stringValue.toFloat() * 10.0) / 10.0); updateDisplay("Offset H");
     } else if (uuid.equals(CHAR_OFFLINE_MODE_UUID)) {
-      preferences.putBool("offline_mode", stringValue.equals("1"));
-      updateDisplay("Modo Offline Cambiado");
+      preferences.putBool("offline_mode", stringValue.equals("1")); updateDisplay("Offline Mode");
     } else if (uuid.equals(CHAR_DISPLAY_EN_UUID)) {
-      g_displayEnabled = stringValue.equals("1");
-      preferences.putBool("display_en", g_displayEnabled);
-      updateDisplay("Pantalla: " + String(g_displayEnabled ? "ON" : "OFF"));
+      g_displayEnabled = stringValue.equals("1"); preferences.putBool("display_en", g_displayEnabled);
     } else if (uuid.equals(CHAR_REINICIAR_UUID)) {
-      updateDisplay("Reiniciando...");
       delay(1000); ESP.restart();
     }
     preferences.end();
@@ -349,11 +266,7 @@ class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
 };
 
 void runConfigMode() {
-  Serial.println("MODO BLE ACTIVADO");
-  
-  g_inConfigMode = true; 
-  updateDisplay("MODO CONFIG BLE");
-
+  g_inConfigMode = true; updateDisplay("MODO CONFIG BLE");
   BLEDevice::init("Heltec_LoRa_Node");
   BLEServer *pServer = BLEDevice::createServer();
   BLEService *pService = pServer->createService(SERVICE_UUID);
@@ -371,107 +284,49 @@ void runConfigMode() {
 
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID); pAdvertising->setScanResponse(true); BLEDevice::startAdvertising();
 
-  while (true) {
-    g_lastValidBatt = getBatteryPercentage();
-    updateDisplay("Esperando App BLE...");
-    delay(5000); 
-  }
+  while (true) { g_lastValidBatt = getBatteryPercentage(); updateDisplay("App BLE..."); delay(5000); }
 }
 
-// =================================================================
-//                 SETUP Y FLUJO PRINCIPAL
-// =================================================================
 void setup() {
   Serial.begin(115200); delay(1000);
-  
-  VextON();
-  displayReset();
-  display.init(); 
-  display.flipScreenVertically();
+  VextON(); displayReset(); display.init(); display.flipScreenVertically();
 
   preferences.begin("lorawan", true);
-  devEUI_str = preferences.getString("devEUI", "");
-  appEUI_str = preferences.getString("appEUI", "");
-  appKey_str = preferences.getString("appKey", "");
-  g_continuousMode = preferences.getBool("cont_mode", false);
-  g_tempOffset = preferences.getFloat("temp_offset", 0.0);
-  g_humOffset = preferences.getFloat("hum_offset", 0.0);
-  g_offlineMode = preferences.getBool("offline_mode", false);
-  g_displayEnabled = preferences.getBool("display_en", true);
-  preferences.end();
+  devEUI_str = preferences.getString("devEUI", ""); appEUI_str = preferences.getString("appEUI", ""); appKey_str = preferences.getString("appKey", "");
+  g_continuousMode = preferences.getBool("cont_mode", false); g_tempOffset = preferences.getFloat("temp_offset", 0.0);
+  g_humOffset = preferences.getFloat("hum_offset", 0.0); g_offlineMode = preferences.getBool("offline_mode", false);
+  g_displayEnabled = preferences.getBool("display_en", true); preferences.end();
 
   I2C_SHT.begin(SHT_SDA_PIN, SHT_SCL_PIN);
-  if (!sht4.begin(&I2C_SHT)) {
-    Serial.println("SHT45 NO ENCONTRADO");
-    g_sensorReadOk = false;
-  } else {
-    Serial.println("SHT45 INICIALIZADO CORRECTAMENTE");
-    sht4.setPrecision(SHT4X_HIGH_PRECISION);
-    sht4.setHeater(SHT4X_NO_HEATER);
-    g_sensorReadOk = true;
-  }
+  if (!sht4.begin(&I2C_SHT)) g_sensorReadOk = false; else { sht4.setPrecision(SHT4X_HIGH_PRECISION); sht4.setHeater(SHT4X_NO_HEATER); g_sensorReadOk = true; }
 
-  pinMode(BAT_ADC_CTRL, OUTPUT);
-  digitalWrite(BAT_ADC_CTRL, HIGH);
-  delay(50);
-  float pinVoltageSetup = analogReadMilliVolts(BAT_ADC) / 1000.0;
-  digitalWrite(BAT_ADC_CTRL, LOW);
-  pinMode(BAT_ADC_CTRL, INPUT);
-  
-  float battVoltageSetup = pinVoltageSetup * 4.9;
-  if (battVoltageSetup >= 4.15) g_isCharging = true;
+  pinMode(BAT_ADC_CTRL, OUTPUT); digitalWrite(BAT_ADC_CTRL, HIGH); delay(50);
+  float pinVoltageSetup = analogReadMilliVolts(BAT_ADC) / 1000.0; digitalWrite(BAT_ADC_CTRL, LOW); pinMode(BAT_ADC_CTRL, INPUT);
+  if ((pinVoltageSetup * 4.9) >= 4.15) g_isCharging = true; g_lastValidBatt = getBatteryPercentage();
 
-  g_lastValidBatt = getBatteryPercentage();
-
-  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
-  updateDisplay("Presione PRG p/ BLE");
-  unsigned long startTime = millis();
-  bool enterConfig = false;
-  while (millis() - startTime < 3000) {
-    if (digitalRead(CONFIG_BUTTON_PIN) == LOW) { enterConfig = true; break; }
-    delay(50);
-  }
-
+  pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP); updateDisplay("PRG p/ BLE");
+  unsigned long startTime = millis(); bool enterConfig = false;
+  while (millis() - startTime < 3000) { if (digitalRead(CONFIG_BUTTON_PIN) == LOW) { enterConfig = true; break; } delay(50); }
   if (enterConfig) runConfigMode();
 
   if (g_isCharging || g_continuousMode || g_offlineMode) {
-    Serial.println("Entrando a Modo Continuo/Carga/Offline");
-    readSensors();
-    if(!g_offlineMode) sendLoRaWANData();
-    updateDisplay("Iniciado...");
+    readSensors(); if(!g_offlineMode) sendLoRaWANData(); updateDisplay("Iniciado...");
   } else {
-    Serial.println("Modo Bateria: Leyendo, enviando y durmiendo.");
-    readSensors();
-    sendLoRaWANData();
-    
-    if (g_displayEnabled) {
-      delay(DISPLAY_ON_TIME_MS);
-    }
-    
+    readSensors(); sendLoRaWANData();
+    if (g_displayEnabled) delay(DISPLAY_ON_TIME_MS);
     display.clear(); display.displayOff(); VextOFF();
-    
-    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION_SEC * 1000000);
-    esp_deep_sleep_start();
+    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION_SEC * 1000000); esp_deep_sleep_start();
   }
 }
 
 void loop() {
   unsigned long currentTime = millis();
-
   if (currentTime - g_lastScreenUpdateTime > (CONTINUOUS_SCREEN_INTERVAL_SEC * 1000)) {
-    readSensors();
-    String title = g_offlineMode ? "Offline" : (g_isCharging ? "Modo Carga" : "Modo Continuo");
-    updateDisplay(title);
-    g_lastScreenUpdateTime = currentTime;
+    readSensors(); updateDisplay(g_offlineMode ? "Offline" : (g_isCharging ? "Modo Carga" : "Modo Continuo")); g_lastScreenUpdateTime = currentTime;
   }
-
   if (!g_offlineMode && (currentTime - g_lastLoraPublishTime > (CONTINUOUS_LORA_INTERVAL_SEC * 1000))) {
-    readSensors();
-    sendLoRaWANData();
-    g_lastLoraPublishTime = currentTime;
+    readSensors(); sendLoRaWANData(); g_lastLoraPublishTime = currentTime;
   }
 }
