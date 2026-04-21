@@ -1,6 +1,7 @@
 /*
  * CÓDIGO FINAL LORAWAN - HELTEC V3.2 + SHT45
  * Librería LoRa: RadioLib
+ * BATERÍA: Optimizado para Li-Ion/LiPo 3.7V (Corte a 3.2V, Max 4.2V)
  * (ENFOQUE DEFINITIVO: Formato Universal Cayenne LPP)
  */
 
@@ -108,15 +109,24 @@ void displayReset(void) {
   digitalWrite(RST_OLED, HIGH); delay(1);
 }
 
+// ---> CÁLCULO DE BATERÍA OPTIMIZADO PARA LI-ION 3.7V <---
 float getBatteryPercentage() {
   pinMode(BAT_ADC_CTRL, OUTPUT); digitalWrite(BAT_ADC_CTRL, HIGH); delay(50); 
   float totalMv = 0;
   for(int i=0; i < 20; i++) { totalMv += analogReadMilliVolts(BAT_ADC); delay(2); }
   digitalWrite(BAT_ADC_CTRL, LOW); pinMode(BAT_ADC_CTRL, INPUT);
 
+  // El divisor de voltaje interno de la Heltec V3 usa un multiplicador de 4.9
   float battVoltage = ((totalMv / 20.0) / 1000.0) * 4.9; 
-  long percentage = map((long)(battVoltage * 100), 340, 420, 0, 100);
-  if (percentage > 100) percentage = 100; else if (percentage < 0) percentage = 0;
+  
+  // Mapeo: 3.2V (320) = 0%, 4.2V (420) = 100%
+  // 3.2V es el voltaje de corte seguro para proteger tu batería de 3000mAh
+  long percentage = map((long)(battVoltage * 100), 320, 420, 0, 100);
+  
+  // Limites estrictos de seguridad
+  if (percentage > 100) percentage = 100; 
+  else if (percentage < 0) percentage = 0;
+  
   return (float)percentage;
 }
 
@@ -304,7 +314,10 @@ void setup() {
 
   pinMode(BAT_ADC_CTRL, OUTPUT); digitalWrite(BAT_ADC_CTRL, HIGH); delay(50);
   float pinVoltageSetup = analogReadMilliVolts(BAT_ADC) / 1000.0; digitalWrite(BAT_ADC_CTRL, LOW); pinMode(BAT_ADC_CTRL, INPUT);
-  if ((pinVoltageSetup * 4.9) >= 4.15) g_isCharging = true; g_lastValidBatt = getBatteryPercentage();
+  
+  // Condición de carga: USB provee voltaje ligeramente más alto
+  if ((pinVoltageSetup * 4.9) >= 4.25) g_isCharging = true; 
+  g_lastValidBatt = getBatteryPercentage();
 
   pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP); updateDisplay("PRG p/ BLE");
   unsigned long startTime = millis(); bool enterConfig = false;
